@@ -1,301 +1,188 @@
 """
-Main pipeline script for reasoning direction analysis.
-
-This script orchestrates the complete pipeline:
-1. Load datasets and models
-2. Extract reasoning directions via contrastive analysis
-3. Perform interventions and evaluate effects
-4. Conduct linear probing experiments
-5. Apply logit lens analysis
-6. Compute cross-model alignment metrics
-7. Generate visualizations and reports
+Main pipeline runner
+Orchestrates the complete reasoning direction analysis workflow
 """
 
 import argparse
-import logging
 import torch
 import json
 from pathlib import Path
-from typing import Dict, List
 
-from .config import PipelineConfig, load_preset_config, RESULTS_DIR
-from .model_utils import (
-    load_model_and_tokenizer,
-    collect_activations,
-    compute_contrastive_directions,
-    apply_direction_intervention,
-    LayerAblator
-)
-from .utils import (
-    load_dataset,
-    create_control_dataset,
-    prepare_prompts,
-    LinearProbe,
-    train_layer_probes,
-    compute_probe_accuracy_curve,
-    compare_probe_accuracies,
-    LogitLens,
-    decode_layer_states,
-    compare_decoded_states,
-    analyze_cross_model_alignment,
-    plot_intervention_effects,
-    plot_layer_alignment,
-    plot_probe_accuracy,
-    plot_direction_similarity,
-    create_summary_figure
-)
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from model_loader import ModelLoader
+from data_processor import DataProcessor
+from direction_calculator import DirectionCalculator
+from intervention import ActivationPatcher
+from evaluator import ReasoningEvaluator
 
 
-def setup_run_directory(config: PipelineConfig) -> Path:
-    """Create run directory for outputs."""
-    if config.run_name:
-        run_dir = Path("pipeline/runs") / config.run_name
-    else:
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = Path("pipeline/runs") / f"run_{timestamp}"
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save config
-    config_path = run_dir / "config.json"
-    # Note: This is simplified - you may want to implement proper config serialization
-    logger.info(f"Run directory: {run_dir}")
-
-    return run_dir
-
-
-def stage1_extract_reasoning_directions(
-    config: PipelineConfig,
-    model_wrapper,
-    run_dir: Path
-) -> Dict[int, torch.Tensor]:
-    """
-    Stage 1: Extract reasoning directions via contrastive activation analysis.
-    """
-    logger.info("=" * 80)
-    logger.info("Stage 1: Extracting Reasoning Directions")
-    logger.info("=" * 80)
-
-    # Load datasets
-    logger.info("Loading reasoning datasets...")
-    gsm8k_data = load_dataset(
-        config.dataset.gsm8k_path,
-        split=config.dataset.gsm8k_split,
-        sample_size=config.dataset.gsm8k_sample_size,
-        seed=config.dataset.seed
-    )
-
-    math_data = load_dataset(
-        config.dataset.math_path,
-        split=config.dataset.math_split,
-        sample_size=config.dataset.math_sample_size,
-        seed=config.dataset.seed
-    )
-
-    # Create control dataset
-    logger.info("Creating control dataset...")
-    control_data = create_control_dataset(
-        size=max(len(gsm8k_data), len(math_data)),
-        task_type=config.dataset.control_task_type,
-        seed=config.dataset.seed
-    )
-
-    # Prepare prompts
-    reasoning_prompts = prepare_prompts(gsm8k_data, dataset_type="gsm8k", include_cot_prompt=True)
-    control_prompts = prepare_prompts(control_data, dataset_type="control", include_cot_prompt=False)
-
-    # Collect activations
-    logger.info("Collecting activations on reasoning tasks...")
-    reasoning_activations = collect_activations(
-        model=model_wrapper.model,
-        tokenizer=model_wrapper.tokenizer,
-        texts=reasoning_prompts,
-        layer_indices=None,  # All layers
-        activation_type=config.experiment.activation_type,
-        device=model_wrapper.device
-    )
-
-    logger.info("Collecting activations on control tasks...")
-    control_activations = collect_activations(
-        model=model_wrapper.model,
-        tokenizer=model_wrapper.tokenizer,
-        texts=control_prompts,
-        layer_indices=None,
-        activation_type=config.experiment.activation_type,
-        device=model_wrapper.device
-    )
-
-    # Compute contrastive directions
-    logger.info("Computing contrastive reasoning directions...")
-    directions = compute_contrastive_directions(
-        reasoning_activations=reasoning_activations,
-        control_activations=control_activations,
-        normalize=config.experiment.normalize_activations
-    )
-
-    # Save directions
-    directions_path = run_dir / "reasoning_directions.pt"
-    torch.save(directions, directions_path)
-    logger.info(f"Saved reasoning directions to {directions_path}")
-
-    return directions
-
-
-def stage2_intervention_analysis(
-    config: PipelineConfig,
-    model_wrapper,
-    directions: Dict[int, torch.Tensor],
-    run_dir: Path
+def run_pipeline(
+    rl_model_name: str = "Qwen/QwQ-32B-Preview",
+    distilled_model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+    dataset_name: str = "HuggingFaceH4/MATH-500",
+    num_samples: int = 10,
+    layers_to_test: list = None,
+    strength_range: tuple = (-0.1, 0.1),
+    num_strengths: int = 5,
+    output_dir: str = "./results",
+    save_directions: bool = True
 ):
     """
-    Stage 2: Evaluate intervention effects.
-    """
-    logger.info("=" * 80)
-    logger.info("Stage 2: Intervention Analysis")
-    logger.info("=" * 80)
+    Run complete reasoning direction analysis pipeline
 
-    # Load test prompts
-    test_data = load_dataset(
-        config.dataset.gsm8k_path,
-        split="test",
-        sample_size=20,  # Small sample for testing
-        seed=config.dataset.seed
+    Args:
+        rl_model_name: RL-trained model name
+        distilled_model_name: Distilled model name
+        dataset_name: Dataset to use
+        num_samples: Number of samples to process
+        layers_to_test: List of layer indices (None = test all)
+        strength_range: (min, max) intervention strength
+        num_strengths: Number of strength values to test
+        output_dir: Directory to save results
+        save_directions: Whether to save computed directions
+    """
+    print("="*60)
+    print("REASONING DIRECTION ANALYSIS PIPELINE")
+    print("="*60)
+
+    # Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: Load models
+    print("\n[Step 1/6] Loading models...")
+    loader = ModelLoader(rl_model_name, distilled_model_name)
+    models = loader.load_models(torch_dtype=torch.float16)
+
+    rl_model = models['rl_model']
+    rl_tokenizer = models['rl_tokenizer']
+    distilled_model = models['distilled_model']
+    distilled_tokenizer = models['distilled_tokenizer']
+
+    model_info = loader.get_model_info()
+    print(f"RL Model: {model_info['rl_model']['num_layers']} layers")
+    print(f"Distilled Model: {model_info['distilled_model']['num_layers']} layers")
+
+    # Step 2: Load and prepare data
+    print("\n[Step 2/6] Loading dataset...")
+    processor = DataProcessor(dataset_name, include_toy_tasks=True)
+    dataset = processor.load_dataset(max_samples=num_samples)
+    toy_tasks = processor.get_toy_tasks()
+
+    # Combine dataset and toy tasks
+    all_examples = dataset + toy_tasks
+    print(f"Loaded {len(all_examples)} examples")
+
+    # Step 3: Calculate reasoning directions
+    print("\n[Step 3/6] Calculating reasoning directions...")
+    calculator = DirectionCalculator()
+
+    # Prepare prompts
+    prompts = processor.prepare_batch(all_examples[:num_samples], rl_tokenizer)
+
+    # Determine layers to analyze
+    num_layers = model_info['rl_model']['num_layers']
+    if layers_to_test is None:
+        # Sample every 5th layer
+        layers_to_test = list(range(0, num_layers, 5))
+
+    print(f"Capturing activations for {len(layers_to_test)} layers...")
+
+    # Capture activations
+    rl_activations = calculator.capture_activations(
+        rl_model, rl_tokenizer, prompts[:5], layers_to_test
     )
-    test_prompts = prepare_prompts(test_data, dataset_type="gsm8k")
-
-    results = {}
-
-    for strength in config.experiment.intervention_strengths:
-        logger.info(f"Testing intervention strength: {strength}")
-
-        generations = []
-        for prompt in test_prompts[:5]:  # Test on subset
-            generated = apply_direction_intervention(
-                model=model_wrapper.model,
-                tokenizer=model_wrapper.tokenizer,
-                prompt=prompt,
-                directions=directions,
-                intervention_strength=strength,
-                max_new_tokens=config.model.max_new_tokens,
-                temperature=config.model.temperature
-            )
-            generations.append(generated)
-
-        results[strength] = generations
-
-    # Save results
-    results_path = run_dir / "intervention_results.json"
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    logger.info(f"Saved intervention results to {results_path}")
-
-    return results
-
-
-def stage3_linear_probing(
-    config: PipelineConfig,
-    model_wrapper,
-    run_dir: Path
-) -> Dict:
-    """
-    Stage 3: Linear probing experiments.
-    """
-    logger.info("=" * 80)
-    logger.info("Stage 3: Linear Probing")
-    logger.info("=" * 80)
-
-    # This is a simplified version - you would need to define specific probing tasks
-    logger.info("Linear probing stage - implement specific tasks as needed")
-
-    # Placeholder for demonstration
-    return {}
-
-
-def run_full_pipeline(config: PipelineConfig):
-    """
-    Run the complete reasoning direction analysis pipeline.
-    """
-    logger.info("Starting Reasoning Direction Analysis Pipeline")
-    logger.info(f"Configuration: {config}")
-
-    # Setup run directory
-    run_dir = setup_run_directory(config)
-
-    # Load model
-    logger.info(f"Loading model: {config.model.rl_model_name}")
-    model_wrapper = load_model_and_tokenizer(
-        model_name=config.model.rl_model_name,
-        device_map=config.model.device_map,
-        torch_dtype=config.model.torch_dtype,
-        load_in_8bit=config.model.load_in_8bit,
-        load_in_4bit=config.model.load_in_4bit,
-        use_flash_attention=config.model.use_flash_attention
+    distilled_activations = calculator.capture_activations(
+        distilled_model, distilled_tokenizer, prompts[:5], layers_to_test
     )
 
-    # Stage 1: Extract reasoning directions
-    directions = stage1_extract_reasoning_directions(config, model_wrapper, run_dir)
+    # Calculate directions
+    directions = calculator.calculate_direction(rl_activations, distilled_activations)
+    print(f"Computed directions for {len(directions)} layers")
 
-    # Stage 2: Intervention analysis
-    intervention_results = stage2_intervention_analysis(config, model_wrapper, directions, run_dir)
+    # Save directions
+    if save_directions:
+        directions_path = output_path / "reasoning_directions.pt"
+        calculator.save_directions(str(directions_path))
 
-    # Stage 3: Linear probing (implement as needed)
-    probing_results = stage3_linear_probing(config, model_wrapper, run_dir)
+    # Step 4: Apply interventions
+    print("\n[Step 4/6] Running interventions...")
+    patcher = ActivationPatcher(rl_model, directions)
 
-    logger.info("=" * 80)
-    logger.info("Pipeline Complete!")
-    logger.info(f"Results saved to: {run_dir}")
-    logger.info("=" * 80)
+    # Test on a sample prompt
+    test_prompt = prompts[0]
 
+    # Baseline generation
+    print("Generating baseline...")
+    inputs = rl_tokenizer(test_prompt, return_tensors="pt").to(rl_model.device)
+    with torch.no_grad():
+        baseline_output = rl_model.generate(**inputs, max_new_tokens=256)
+    baseline_text = rl_tokenizer.decode(baseline_output[0], skip_special_tokens=True)
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description="Run reasoning direction analysis pipeline")
-
-    parser.add_argument(
-        "--preset",
-        type=str,
-        default="quick_test",
-        choices=["quick_test", "full_analysis", "layer_specific"],
-        help="Configuration preset to use"
+    # Sweep interventions
+    print("Sweeping layers and strengths...")
+    intervention_results = patcher.sweep_layers_and_strengths(
+        tokenizer=rl_tokenizer,
+        prompt=test_prompt,
+        layer_range=(min(layers_to_test), max(layers_to_test)),
+        strength_range=strength_range,
+        num_strengths=num_strengths,
+        max_new_tokens=256
     )
 
-    parser.add_argument(
-        "--run_name",
-        type=str,
-        default=None,
-        help="Name for this run (default: timestamp)"
+    print(f"Completed {len(intervention_results)} intervention experiments")
+
+    # Step 5: Evaluate results
+    print("\n[Step 5/6] Evaluating results...")
+    evaluator = ReasoningEvaluator()
+
+    # Analyze layer sensitivity
+    sensitivity = evaluator.analyze_layer_sensitivity(intervention_results)
+    critical_layers = evaluator.identify_critical_layers(sensitivity)
+
+    print(f"Critical layers identified: {critical_layers}")
+
+    # Step 6: Generate report
+    print("\n[Step 6/6] Generating report...")
+    report = evaluator.generate_report(
+        intervention_results,
+        output_file=str(output_path / "evaluation_report.txt")
     )
 
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Override model name"
-    )
+    # Save all results
+    results_data = {
+        'model_info': model_info,
+        'directions_stats': calculator.compute_direction_stats(),
+        'critical_layers': critical_layers,
+        'layer_sensitivity': sensitivity,
+        'intervention_results': intervention_results,
+        'baseline_output': baseline_text
+    }
 
-    args = parser.parse_args()
+    with open(output_path / "results.json", 'w') as f:
+        json.dump(results_data, f, indent=2, default=str)
 
-    # Load configuration
-    config = load_preset_config(args.preset)
+    print("\n" + "="*60)
+    print("Pipeline completed!")
+    print(f"Results saved to: {output_dir}")
+    print("="*60)
 
-    # Apply overrides
-    if args.run_name:
-        config.run_name = args.run_name
-
-    if args.model:
-        config.model.rl_model_name = args.model
-
-    # Run pipeline
-    run_full_pipeline(config)
+    return results_data
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run reasoning direction analysis pipeline")
+    parser.add_argument("--rl-model", type=str, default="Qwen/QwQ-32B-Preview")
+    parser.add_argument("--distilled-model", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-32B")
+    parser.add_argument("--dataset", type=str, default="HuggingFaceH4/MATH-500")
+    parser.add_argument("--num-samples", type=int, default=10)
+    parser.add_argument("--output-dir", type=str, default="./results")
+
+    args = parser.parse_args()
+
+    run_pipeline(
+        rl_model_name=args.rl_model,
+        distilled_model_name=args.distilled_model,
+        dataset_name=args.dataset,
+        num_samples=args.num_samples,
+        output_dir=args.output_dir
+    )

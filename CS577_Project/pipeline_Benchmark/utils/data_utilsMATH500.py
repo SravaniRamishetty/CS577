@@ -1,6 +1,8 @@
 """
-Data loading and processing utilities.
+Data loading and processing utilities for MATH-500 benchmark.
 Based on: https://github.com/rasbt/reasoning-from-scratch/blob/main/ch03/01_main-chapter-code/ch03_main.ipynb
+
+Includes improved answer extraction and grading from Raschka's implementation.
 """
 
 import json
@@ -11,13 +13,17 @@ import requests
 from datasets import load_dataset as hf_load_dataset
 from typing import List, Dict, Tuple, Optional, Union
 import logging
+from sympy import simplify
+from sympy.parsing import sympy_parser as spp
+from sympy.core.sympify import SympifyError
 
 logger = logging.getLogger(__name__)
 
-# Regular expression for extracting numbers
-RE_NUMBER = re.compile(
-    r'[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?'
-)
+# Regular expression for extracting numbers (including fractions, decimals, scientific notation)
+RE_NUMBER = re.compile(r"-?(?:\d+/\d+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)")
+
+# Regex to strip chat special tokens like <|assistant|>
+RE_SPECIAL = re.compile(r"<\|[^>]+?\|>")
 
 
 def load_math500_data(
@@ -158,12 +164,13 @@ def create_control_dataset(
     return control_data
 
 
-def render_prompt(prompt: str) -> str:
+def render_prompt(question: str) -> str:
     """
-    Render a math problem prompt with instruction template for MATH-500.
+    Build the prompt for the model following Raschka's format.
+    Instructs model to output answer in \\boxed{} format.
 
     Args:
-        prompt: The math problem question
+        question: The math problem to solve
 
     Returns:
         Formatted prompt string
@@ -172,8 +179,7 @@ def render_prompt(prompt: str) -> str:
         "You are a helpful math assistant.\n"
         "Answer the question and write the final result on a new line as:\n"
         "\\boxed{ANSWER}\n\n"
-        f"Question:\n{prompt}\n\n"
-        "Answer:"
+        f"Question:\n{question}\n\nAnswer:"
     )
     return template
 
@@ -266,17 +272,50 @@ def extract_reasoning_steps(
 
 def get_last_boxed(text: str) -> Optional[str]:
     """
-    Extract the last \\boxed{...} expression from text.
+    Extract the content inside the last \\boxed{...} in the text.
+    Handles nested braces correctly.
 
     Args:
-        text: Text containing boxed expressions
+        text: Generated text that may contain \\boxed{answer}
 
     Returns:
-        Content of the last boxed expression or None
+        Content inside the last \\boxed{} or None if not found
     """
-    pattern = r'\\boxed\{([^}]*)\}'
-    matches = re.findall(pattern, text)
-    return matches[-1] if matches else None
+    # Find the last occurrence of "\boxed"
+    boxed_start_idx = text.rfind(r"\boxed")
+    if boxed_start_idx == -1:
+        return None
+
+    # Get position after "\boxed"
+    current_idx = boxed_start_idx + len(r"\boxed")
+
+    # Skip any whitespace after "\boxed"
+    while current_idx < len(text) and text[current_idx].isspace():
+        current_idx += 1
+
+    # Expect an opening brace "{"
+    if current_idx >= len(text) or text[current_idx] != "{":
+        return None
+
+    # Parse the braces with nesting support
+    current_idx += 1
+    brace_depth = 1
+    content_start_idx = current_idx
+
+    while current_idx < len(text) and brace_depth > 0:
+        char = text[current_idx]
+        if char == "{":
+            brace_depth += 1
+        elif char == "}":
+            brace_depth -= 1
+        current_idx += 1
+
+    # Check for unbalanced braces
+    if brace_depth != 0:
+        return None
+
+    # Extract content inside the outermost braces
+    return text[content_start_idx:current_idx-1]
 
 
 def extract_final_candidate(
@@ -284,11 +323,12 @@ def extract_final_candidate(
     fallback: str = 'number_then_full'
 ) -> str:
     """
-    Extract the final answer candidate from model output (MATH-500 format).
+    Extract the final answer from generated text.
+    Prefers \\boxed{} format, falls back to extracting last number.
 
     Args:
-        text: Model output text
-        fallback: Fallback strategy ('number_then_full', 'number_only', or 'none')
+        text: Generated text from the model
+        fallback: Strategy when \\boxed{} not found ("number_then_full" or "number_only")
 
     Returns:
         Extracted answer string
@@ -296,67 +336,258 @@ def extract_final_candidate(
     result = ""
 
     if text:
-        # Prefer last boxed expression
+        # Prefer the last boxed expression if present
         boxed = get_last_boxed(text.strip())
         if boxed:
-            result = boxed.strip().strip('$ ')
-
-        # Fallback to number extraction
-        elif fallback in ('number_then_full', 'number_only'):
+            result = boxed.strip().strip("$ ")
+        # If no boxed expression, try fallback
+        elif fallback in ("number_then_full", "number_only"):
             m = RE_NUMBER.findall(text)
             if m:
+                # Use last number found
                 result = m[-1]
-            elif fallback == 'number_then_full':
+            elif fallback == "number_then_full":
+                # Return full text if no number found
                 result = text
-
     return result
 
 
 def split_into_parts(text: str) -> List[str]:
     """
-    Split a text into parts if it looks like a tuple/list.
+    Split tuple/list answers into individual parts for comparison.
+    Example: "(1, 2, 3)" -> ["1", "2", "3"]
 
     Args:
-        text: Text to split
+        text: Answer text that may be a tuple or list
 
     Returns:
-        List of parts (original text if not a tuple/list)
+        List of individual answer parts
     """
     result = [text]
 
     if text:
-        # Check if text looks like a tuple/list
-        if (len(text) >= 2 and
-            text[0] in '([' and text[-1] in ')]' and
-            ',' in text[1:-1]):
-            items = [p.strip() for p in text[1:-1].split(',')]
+        # Check if text looks like a tuple or list, e.g. "(a, b)" or "[a, b]"
+        if (
+            len(text) >= 2
+            and text[0] in "([" and text[-1] in ")]"
+            and "," in text[1:-1]
+        ):
+            # Split on commas inside brackets and strip whitespace
+            items = [p.strip() for p in text[1:-1].split(",")]
             if all(items):
                 result = items
+    else:
+        # If text is empty, return an empty list
+        result = []
 
     return result
 
 
-def normalize_answer(answer: str) -> str:
+# LaTeX formatting patterns to normalize
+LATEX_FIXES = [
+    (r"\\left\s*", ""),
+    (r"\\right\s*", ""),
+    (r"\\,|\\!|\\;|\\:", ""),
+    (r"\\cdot", "*"),
+    (r"\u00B7|\u00D7", "*"),
+    (r"\\\^\\circ", ""),
+    (r"\\dfrac", r"\\frac"),
+    (r"\\tfrac", r"\\frac"),
+    (r"°", ""),
+]
+
+
+def normalize_text(text: str) -> str:
     """
-    Normalize an answer for comparison.
+    Normalize mathematical text by handling LaTeX, unicode, fractions, etc.
+    This is crucial for comparing model outputs with ground truth answers.
 
     Args:
-        answer: Raw answer string
+        text: Raw mathematical expression (may contain LaTeX)
 
     Returns:
-        Normalized answer string
+        Normalized lowercase string suitable for comparison
     """
-    # Remove extra whitespace
-    answer = ' '.join(answer.split())
+    if not text:
+        return ""
 
-    # Remove dollar signs
-    answer = answer.strip('$').strip()
+    text = RE_SPECIAL.sub("", text).strip()
 
-    # Handle common formatting
-    answer = answer.replace('\\text{', '').replace('}', '')
-    answer = answer.replace('\\,', '')
+    # Map for converting unicode superscripts to normal characters
+    SUPERSCRIPT_MAP = {
+        "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+        "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+        "⁺": "+", "⁻": "-", "⁽": "(", "⁾": ")",
+    }
 
-    return answer
+    # Remove angle-degree markers
+    text = re.sub(r"\^\s*\{\s*\\circ\s*\}", "", text)   # ^{\circ}
+    text = re.sub(r"\^\s*\\circ", "", text)             # ^\circ
+    text = text.replace("°", "")                        # Unicode degree
+
+    # Unwrap \text{...} if the whole string is wrapped
+    match = re.match(r"^\\text\{(?P<x>.+?)\}$", text)
+    if match:
+        text = match.group("x")
+
+    # Strip inline/display math wrappers \( \) \[ \]
+    text = re.sub(r"\\\(|\\\)|\\\[|\\\]", "", text)
+
+    # Apply LaTeX canonicalization
+    for pat, rep in LATEX_FIXES:
+        text = re.sub(pat, rep, text)
+
+    def convert_superscripts(s, base=None):
+        """Convert unicode superscripts to exponent notation"""
+        converted = "".join(
+            SUPERSCRIPT_MAP[ch] if ch in SUPERSCRIPT_MAP else ch
+            for ch in s
+        )
+        if base is None:
+            return converted
+        return f"{base}**{converted}"
+
+    # Convert unicode superscripts into exponent form (e.g., 2² -> 2**2)
+    text = re.sub(
+        r"([0-9A-Za-z\)\]\}])([⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻]+)",
+        lambda m: convert_superscripts(m.group(2), base=m.group(1)),
+        text,
+    )
+    text = convert_superscripts(text)
+
+    # Handle percentages and dollar signs
+    text = text.replace("\\%", "%").replace("$", "").replace("%", "")
+
+    # Convert \sqrt{...} to sqrt(...)
+    text = re.sub(
+        r"\\sqrt\s*\{([^}]*)\}",
+        lambda match: f"sqrt({match.group(1)})",
+        text,
+    )
+    text = re.sub(
+        r"\\sqrt\s+([^\\\s{}]+)",
+        lambda match: f"sqrt({match.group(1)})",
+        text,
+    )
+
+    # Convert \frac{a}{b} to (a)/(b)
+    text = re.sub(
+        r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}",
+        lambda match: f"({match.group(1)})/({match.group(2)})",
+        text,
+    )
+    text = re.sub(
+        r"\\frac\s+([^\s{}]+)\s+([^\s{}]+)",
+        lambda match: f"({match.group(1)})/({match.group(2)})",
+        text,
+    )
+
+    # Convert exponents: ^ to **
+    text = text.replace("^", "**")
+
+    # Handle mixed numbers (e.g., "2 1/2" -> "2+1/2")
+    text = re.sub(
+        r"(?<=\d)\s+(\d+/\d+)",
+        lambda match: "+" + match.group(1),
+        text,
+    )
+
+    # Remove thousand separators (e.g., 1,234 -> 1234)
+    text = re.sub(
+        r"(?<=\d),(?=\d\d\d(\D|$))",
+        "",
+        text,
+    )
+
+    # Remove remaining braces and convert to lowercase
+    return text.replace("{", "").replace("}", "").strip().lower()
+
+
+def sympy_parser(expr: str) -> Optional['sympy.Expr']:
+    """
+    Parse a mathematical expression using SymPy with appropriate transformations.
+
+    Args:
+        expr: Normalized mathematical expression string
+
+    Returns:
+        SymPy expression object or None if parsing fails
+    """
+    try:
+        return spp.parse_expr(
+            expr,
+            transformations=(
+                # Standard transformations like handling parentheses
+                *spp.standard_transformations,
+                # Allow omitted multiplication symbols (e.g., "2x" -> "2*x")
+                spp.implicit_multiplication_application,
+            ),
+            # Evaluate during parsing so simple constants simplify (e.g., 2+3 -> 5)
+            evaluate=True,
+        )
+    except (SympifyError, SyntaxError, TypeError, IndexError):
+        return None
+
+
+def equality_check(expr_gtruth: str, expr_pred: str) -> bool:
+    """
+    Check if two mathematical expressions are equivalent.
+    Uses both string comparison and symbolic SymPy comparison.
+
+    Args:
+        expr_gtruth: Ground truth expression (normalized)
+        expr_pred: Predicted expression (normalized)
+
+    Returns:
+        True if expressions are mathematically equivalent
+    """
+    # First, check exact string match
+    if expr_gtruth == expr_pred:
+        return True
+
+    # Parse both expressions into SymPy objects
+    gtruth, pred = sympy_parser(expr_gtruth), sympy_parser(expr_pred)
+
+    # If both parsed successfully, try symbolic comparison
+    if gtruth is not None and pred is not None:
+        try:
+            # If the difference simplifies to 0, they are equivalent
+            return simplify(gtruth - pred) == 0
+        except (SympifyError, TypeError):
+            pass
+
+    return False
+
+
+def grade_answer(pred_text: str, gt_text: str) -> bool:
+    """
+    Grade a predicted answer against ground truth.
+    Handles normalization, tuple/list splitting, and symbolic comparison.
+
+    Args:
+        pred_text: Model's predicted answer
+        gt_text: Ground truth answer
+
+    Returns:
+        True if answer is correct, False otherwise
+    """
+    result = False  # Default outcome if checks fail
+
+    # Only continue if both inputs are non-empty strings
+    if pred_text is not None and gt_text is not None:
+        # Normalize and split both answers into comparable parts
+        gt_parts = split_into_parts(normalize_text(gt_text))
+        pred_parts = split_into_parts(normalize_text(pred_text))
+
+        # Ensure both sides have same number of valid parts
+        if (gt_parts and pred_parts and len(gt_parts) == len(pred_parts)):
+            # Check each part for mathematical equivalence
+            result = all(
+                equality_check(gt, pred)
+                for gt, pred in zip(gt_parts, pred_parts)
+            )
+
+    return result
 
 
 def parse_answer(
