@@ -21,21 +21,38 @@ class ReasoningEvaluator:
         """
         Extract content inside and outside <think> tags
 
+        FIXED: Now handles incomplete tags (missing </think> due to truncation)
+
         Args:
             text: Generated text
 
         Returns:
             Tuple of (think_content, non_think_content)
         """
-        # Find all <think>...</think> blocks
-        think_pattern = r'<think>(.*?)</think>'
-        think_matches = re.findall(think_pattern, text, re.DOTALL)
+        # Find all complete <think>...</think> blocks
+        complete_pattern = r'<think>(.*?)</think>'
+        complete_matches = re.findall(complete_pattern, text, re.DOTALL)
+
+        # Find incomplete <think>... blocks (missing closing tag)
+        incomplete_pattern = r'<think>(.*?)$'
+        incomplete_match = re.search(incomplete_pattern, text, re.DOTALL)
+
+        # Combine complete and incomplete matches
+        all_think_content = []
+        if complete_matches:
+            all_think_content.extend(complete_matches)
+        if incomplete_match and not complete_matches:
+            # Only use incomplete match if no complete matches found
+            # This handles truncated generations
+            all_think_content.append(incomplete_match.group(1))
 
         # Extract think content
-        think_content = ' '.join(think_matches)
+        think_content = ' '.join(all_think_content)
 
-        # Remove think tags to get non-think content
-        non_think_content = re.sub(think_pattern, '', text, flags=re.DOTALL)
+        # Remove both complete and incomplete think tags to get non-think content
+        non_think_content = re.sub(complete_pattern, '', text, flags=re.DOTALL)
+        if incomplete_match and not complete_matches:
+            non_think_content = re.sub(incomplete_pattern, '', non_think_content, flags=re.DOTALL)
 
         return think_content, non_think_content
 
@@ -199,9 +216,10 @@ class ReasoningEvaluator:
         ranges = [stats['range'] for stats in layer_sensitivity.values()]
         threshold = np.percentile(ranges, threshold_percentile)
 
+        # Fix: Only mark as critical if range > 0 AND above threshold
         critical_layers = [
             layer for layer, stats in layer_sensitivity.items()
-            if stats['range'] >= threshold
+            if stats['range'] > 0 and stats['range'] >= threshold
         ]
 
         return sorted(critical_layers)

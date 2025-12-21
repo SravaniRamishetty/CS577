@@ -176,7 +176,8 @@ class ActivationPatcher:
         layer_range: Tuple[int, int],
         strength_range: Tuple[float, float],
         num_strengths: int = 10,
-        max_new_tokens: int = 512
+        max_new_tokens: int = 512,
+        evaluator=None
     ) -> List[Dict]:
         """
         Sweep across layers and intervention strengths
@@ -188,6 +189,7 @@ class ActivationPatcher:
             strength_range: (min_strength, max_strength) tuple
             num_strengths: Number of strength values to test
             max_new_tokens: Maximum tokens to generate
+            evaluator: Optional ReasoningEvaluator for quality metrics
 
         Returns:
             List of results dictionaries
@@ -208,11 +210,20 @@ class ActivationPatcher:
                     max_new_tokens=max_new_tokens
                 )
 
-                results.append({
+                result = {
                     'layer': layer,
                     'strength': float(strength),
                     'output': output,
                     'token_count': len(tokenizer.encode(output))
-                })
+                }
+
+                # Add quality metrics if evaluator provided
+                if evaluator is not None:
+                    tokens = evaluator.count_tokens(output, tokenizer, split_by_tags=True)
+                    quality = evaluator.analyze_reasoning_quality(output)
+                    result['tokens'] = tokens
+                    result['quality'] = quality
+
+                results.append(result)
 
         return results
