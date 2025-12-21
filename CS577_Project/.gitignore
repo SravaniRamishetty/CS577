@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment
+.env
+.env.local
+
+# Data and Models
+data/*/
+!data/.gitkeep
+models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Results
+results/*/
+!results/.gitkeep
+!results/**/.gitkeep
+pipeline/runs/*/
+!pipeline/runs/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Weights & Biases
+wandb/
+
+# Cache
+.cache/
+*.cache
+
+# Logs
+*.log
